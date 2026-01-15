@@ -127,5 +127,4 @@ python app.py
 ### 📝 版本資訊
 
 * **Version**: 1.0.0
-* **Last Updated**: 2026-01-02
-* **Author**: 程式夥伴 (AI Partner)
+* **Last Updated**: 2026-01-15
