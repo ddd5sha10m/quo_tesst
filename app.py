@@ -15,6 +15,10 @@ from barcode import Code128
 from barcode.writer import ImageWriter
 from PIL import Image, ImageTk
 
+# 導入檔案系統監控套件 (跨平台支援)
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
 # ================= 設定區 =================
 # 1. 儀器磁碟機的根目錄 (用來執行掛載/卸載)
 VOLUME_PATH = '/Volumes/QTEST1A9166' 
@@ -30,11 +34,60 @@ LOG_FILE = './processed_history.txt'
 CHECK_INTERVAL = 300
 # =========================================
 
+class ResFileHandler(FileSystemEventHandler):
+    """檔案系統事件處理器：監控 .res 檔案的建立"""
+    def __init__(self, app):
+        self.app = app
+        self.processing_lock = threading.Lock()
+    
+    def on_created(self, event):
+        """當有新檔案建立時觸發"""
+        if event.is_directory:
+            return
+        
+        filename = os.path.basename(event.src_path)
+        
+        # 只處理 .res 檔案，且排除幽靈檔案
+        if filename.lower().endswith('.res') and not filename.startswith('._'):
+            # 等待一下確保檔案寫入完成
+            time.sleep(1)
+            
+            with self.processing_lock:
+                processed_files = self.app.get_processed_files()
+                if filename not in processed_files:
+                    self.app.log_message(f"🔔 偵測到新檔案: {filename}")
+                    self.app.process_files([filename])
+    
+    def on_modified(self, event):
+        """當檔案被修改時觸發（某些系統會先建立空檔再寫入）"""
+        if event.is_directory:
+            return
+        
+        filename = os.path.basename(event.src_path)
+        
+        # 只處理 .res 檔案，且排除幽靈檔案
+        if filename.lower().endswith('.res') and not filename.startswith('._'):
+            # 檢查檔案大小，確保不是空檔
+            try:
+                if os.path.getsize(event.src_path) > 0:
+                    time.sleep(0.5)  # 等待寫入完成
+                    
+                    with self.processing_lock:
+                        processed_files = self.app.get_processed_files()
+                        if filename not in processed_files:
+                            self.app.log_message(f"📝 檔案已更新: {filename}")
+                            self.app.process_files([filename])
+            except:
+                pass
+
 class InstrumentApp:
     def __init__(self, root):
         self.root = root
         self.root.title("儀器資料監控與條碼助手")
         self.root.geometry("500x750") # 拉長視窗高度以容納按鈕
+        
+        # 檔案系統監控器
+        self.observer = None
 
         # --- 上半部：條碼產生器 ---
         self.frame_top = tk.LabelFrame(root, text="條碼產生器", padx=10, pady=10)
@@ -165,45 +218,54 @@ class InstrumentApp:
         threading.Thread(target=self.remount_drive).start()
 
     def start_monitoring_thread(self):
+        """啟動雙重監控機制：即時監控 + 定期掃描"""
+        # 1. 啟動即時檔案系統監控
+        if os.path.exists(SOURCE_FOLDER):
+            try:
+                event_handler = ResFileHandler(self)
+                self.observer = Observer()
+                self.observer.schedule(event_handler, SOURCE_FOLDER, recursive=False)
+                self.observer.start()
+                self.log_message("✅ 即時檔案監控已啟動")
+            except Exception as e:
+                self.log_message(f"⚠️ 即時監控啟動失敗: {e}")
+                self.log_message("將使用定期掃描模式")
+        
+        # 2. 啟動定期掃描（作為備援機制）
         thread = threading.Thread(target=self.monitor_logic, daemon=True)
         thread.start()
 
     def monitor_logic(self):
-        """監控邏輯：自動刷新 -> 比對檔案 -> 轉檔"""
+        """定期掃描邏輯（作為即時監控的備援機制）"""
         
         # 確保本地檔案存在
         if not os.path.exists(OUTPUT_CSV): open(OUTPUT_CSV, 'a').close()
         if not os.path.exists(LOG_FILE): open(LOG_FILE, 'a').close()
+        
+        self.log_message(f"🔄 定期掃描已啟動 (間隔: {CHECK_INTERVAL}秒)")
 
         while True:
             try:
-                # === [新增] 自動刷新機制 ===
-                # 只有當儀器插著的時候才嘗試刷新
-                if os.path.exists(VOLUME_PATH):
-                    # 執行重新掛載，強迫更新檔案列表
-                    # 注意：這會導致 Finder 視窗跳出，這是正常的
-                    self.remount_drive()
-                else:
-                    self.log_message(f"⚠️ 偵測不到儀器: {VOLUME_PATH}")
-
-                # === 檔案檢查與處理 ===
+                time.sleep(CHECK_INTERVAL)
+                
                 if os.path.exists(SOURCE_FOLDER):
-                    current_files = [f for f in os.listdir(SOURCE_FOLDER) if f.upper().endswith('.RES')]
+                    # 抓取所有 .res 檔案（不分大小寫）
+                    all_files = [f for f in os.listdir(SOURCE_FOLDER) if f.lower().endswith('.res')]
+                    
+                    # 過濾掉 ._ 開頭的幽靈檔案
+                    valid_files = [f for f in all_files if not f.startswith('._')]
+
                     processed_files = self.get_processed_files()
-                    files_to_process = [f for f in current_files if f not in processed_files]
+                    files_to_process = [f for f in valid_files if f not in processed_files]
 
                     if files_to_process:
-                        self.log_message(f"🔎 發現 {len(files_to_process)} 個新檔案，處理中...")
+                        self.log_message(f"🔎 定期掃描發現 {len(files_to_process)} 個新檔案")
                         self.process_files(files_to_process)
-                    else:
-                        # 沒事做的時候安靜一點
-                        pass
-                
-                # 休息時間 (建議設定 15 秒以上，避免頻繁刷新造成系統負擔)
-                time.sleep(CHECK_INTERVAL)
+                else:
+                    self.log_message(f"⚠️ 找不到資料夾: {SOURCE_FOLDER}")
 
             except Exception as e:
-                self.log_message(f"監控發生錯誤: {e}")
+                self.log_message(f"定期掃描錯誤: {e}")
                 time.sleep(CHECK_INTERVAL)
 
     def get_processed_files(self):
@@ -242,55 +304,81 @@ class InstrumentApp:
     
 
     def parse_res_file(self, file_path):
+        """
+        雙重解析模式：
+        1. 優先讀取檔案內容 (標準格式)
+        2. 若失敗，則嘗試讀取檔名 (救援模式)
+        檔名範例: 0080p_A1C_5.5.res
+        """
         data = {}
-        #解析新格式 RES 檔案
-        #範例: 19990510|00074|A1C^...|5.5%A1C...
+        filename = os.path.basename(file_path)
+        
+        # --- 策略 A: 嘗試讀取檔案內容 ---
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read().strip()
+                
+            # 檢查內容是否正常 (要有 | 分隔符號)
+            if '|' in content:
                 parts = content.split('|')
-            
-            # 確保有足夠的區塊
-            if len(parts) < 4:
-                return None
-
-            # 1. 病人ID (第1塊)
-            data['Patient_ID'] = parts[0].strip()
-
-            # 2. 檢體順序號 (第2塊)
-            data['Sample_Seq'] = parts[1].strip()
-            
-            # 3. 檢驗項目與時間 (第3塊) -> A1C^020877^2025/12/31...
-            meta_info = parts[2].split('^')
-            data['Test_Name'] = meta_info[0] # A1C
-            
-            # 處理時間 (抓取 meta_info[2])
-            # 原始可能是 "2025/12/31 09:47:291A1A..."，我們只取前19個字元
-            raw_time = meta_info[2]
-            if len(raw_time) >= 19:
-                data['Timestamp'] = raw_time[:19]
-            else:
-                data['Timestamp'] = raw_time
-
-            # 4. 結果數值 (第4塊) -> 5.5%A1C^DCCT...
-            result_block = parts[3].split('^')[0] # 拿到 "5.5%A1C"
-            
-            # 嘗試分離數值與單位 (以 % 切割)
-            if '%' in result_block:
-                val, unit = result_block.split('%', 1)
-                data['Result_Value'] = val
-                data['Unit'] = '%' + unit # 把 % 加回去單位
-            else:
-                # 如果沒有 %，就整串當作數值
-                data['Result_Value'] = result_block
-                data['Unit'] = ''
-
-            data['Source_File'] = os.path.basename(file_path)
+                if len(parts) >= 4:
+                    # === 既有的解析邏輯 ===
+                    data['Patient_ID'] = parts[0].strip()
+                    data['Sample_Seq'] = parts[1].strip()
+                    meta = parts[2].split('^')
+                    data['Test_Name'] = meta[0] if len(meta) > 0 else ""
+                    raw_time = meta[2] if len(meta) > 2 else ""
+                    data['Timestamp'] = raw_time[:19] if len(raw_time) >= 19 else datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+                    
+                    res_block = parts[3].split('^')[0]
+                    if '%' in res_block:
+                        v, u = res_block.split('%', 1)
+                        data['Result_Value'] = v
+                        data['Unit'] = '%' + u
+                    else:
+                        data['Result_Value'] = res_block
+                        data['Unit'] = ''
+                    
+                    data['Source_File'] = filename
+                    return data # 成功回傳，結束函式
 
         except Exception as e:
-            print(f"讀取錯誤 {file_path}: {e}")
+            # 讀取失敗沒關係，我們還有 Plan B
+            pass 
+
+        # --- 策略 B: 檔名救援模式 ---
+        # 如果上面失敗了 (內容是空的，或沒有 | )，我們來解析檔名
+        # 假設檔名格式: 0080p_A1C_5.5.res
+        try:
+            # 去除副檔名 -> 0080p_A1C_5.5
+            name_body = os.path.splitext(filename)[0]
+            
+            # 用底線 _ 切割
+            parts = name_body.split('_')
+            
+            # 確保至少切出 3 塊 (序號, 項目, 結果)
+            if len(parts) >= 3:
+                self.log_message(f"⚠️ 啟動檔名解析模式: {filename}")
+                
+                # 0080p -> 去掉 p 當作序號或ID
+                raw_id = parts[0].replace('p', '').replace('P', '')
+                data['Patient_ID'] = "Unknown" # 檔名沒給病人ID，先填未知
+                data['Sample_Seq'] = raw_id
+                
+                data['Test_Name'] = parts[1] # A1C
+                data['Result_Value'] = parts[2] # 5.5
+                data['Unit'] = "" # 檔名通常沒單位
+                data['Timestamp'] = datetime.now().strftime("%Y/%m/%d %H:%M:%S") # 用現在時間
+                data['Source_File'] = filename
+                
+                return data
+            else:
+                self.log_message(f"❌ 檔名格式也不符: {filename}")
+                return None
+
+        except Exception as e:
+            self.log_message(f"解析全失敗 {filename}: {e}")
             return None
-        return data
 
 if __name__ == "__main__":
     root = tk.Tk()
